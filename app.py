@@ -30,7 +30,7 @@ current_settings = {
     "password": ""
 }
 
-# قائمة العملات الافتراضية (في حالة فشل الاتصال)
+# قائمة العملات الافتراضية
 default_assets = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "BTC/USD", "ETH/USD", "XAU/USD"]
 
 # ============= دوال التحليل الفني =============
