@@ -1,223 +1,192 @@
 from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
-import secrets
-import numpy as np
+import threading
+import time
 import random
+import numpy as np
 
 app = Flask(__name__)
 
-# ============= قاعدة بيانات التراخيص =============
-valid_licenses = {
-    "ALKING-TEST-123": {
-        "email": "your-email@example.com",  # 🔥 غير هذا إلى إيميلك الحقيقي
-        "expiry_date": (datetime.now() + timedelta(days=30)).isoformat(),
-        "device_id": None,
-    },
+# محاولة استيراد pyquotex
+try:
+    from pyquotex import Quotex
+    QUOTEX_AVAILABLE = True
+except ImportError:
+    QUOTEX_AVAILABLE = False
+    print("⚠️ pyquotex غير مثبت، استخدام وضع المحاكاة")
+
+# متغيرات البوت
+bot_active = False
+win_streak = 0
+loss_streak = 0
+total_trades = 0
+client = None
+current_settings = {
+    "pair": "EUR/USD",
+    "amount": 10,
+    "duration": 5,
+    "target_trades": 5,
+    "max_trades_per_day": 50,
+    "email": "",
+    "password": ""
 }
-ADMIN_PASSWORD = "admin123"
-user_sessions = {}
 
-def generate_random_code():
-    return secrets.token_hex(4).upper()
+# قائمة العملات الافتراضية (في حالة فشل الاتصال)
+default_assets = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "BTC/USD", "ETH/USD", "XAU/USD"]
 
-# ============= التحليل الفني (RSI + MACD + BB) =============
-
+# ============= دوال التحليل الفني =============
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50
-    gains, losses = 0, 0
+    gain, loss = 0, 0
     for i in range(-period, 0):
         change = prices[i] - prices[i-1]
         if change > 0:
-            gains += change
+            gain += change
         else:
-            losses -= change
-    if losses == 0:
+            loss -= change
+    if loss == 0:
         return 100
-    rs = gains / losses
+    rs = gain / loss
     return 100 - (100 / (1 + rs))
-
-def calculate_macd(prices, fast=12, slow=26, signal=9):
-    if len(prices) < slow:
-        return False, False
-    def ema(data, period):
-        if len(data) < period:
-            return data[-1]
-        multiplier = 2 / (period + 1)
-        ema_val = sum(data[:period]) / period
-        for i in range(period, len(data)):
-            ema_val = (data[i] - ema_val) * multiplier + ema_val
-        return ema_val
-    ema_fast = ema(prices, fast)
-    ema_slow = ema(prices, slow)
-    macd_line = ema_fast - ema_slow
-    ema_fast_prev = ema(prices[:-1], fast)
-    ema_slow_prev = ema(prices[:-1], slow)
-    macd_prev = ema_fast_prev - ema_slow_prev
-    signal_line = ema(prices, signal)
-    signal_prev = ema(prices[:-1], signal)
-    bullish = macd_line > signal_line and macd_prev <= signal_prev
-    bearish = macd_line < signal_line and macd_prev >= signal_prev
-    return bullish, bearish
-
-def calculate_bollinger(prices, period=20, std_dev=2.0):
-    if len(prices) < period:
-        return False, False
-    sma = sum(prices[-period:]) / period
-    variance = sum((p - sma) ** 2 for p in prices[-period:]) / period
-    std = np.sqrt(variance)
-    lower_band = sma - (std_dev * std)
-    upper_band = sma + (std_dev * std)
-    return prices[-1] <= lower_band, prices[-1] >= upper_band
 
 def analyze_market(prices):
     if len(prices) < 50:
         return "HOLD", 0
     rsi = calculate_rsi(prices)
-    macd_bullish, macd_bearish = calculate_macd(prices)
-    at_lower, at_upper = calculate_bollinger(prices)
-    
-    # إشارة شراء قوية (4 شروط)
-    if rsi < 25 and macd_bullish and at_lower:
+    if rsi < 25:
         return "BUY", 85
-    # إشارة بيع قوية (4 شروط)
-    if rsi > 75 and macd_bearish and at_upper:
+    if rsi > 75:
         return "SELL", 85
-    # إشارة شراء متوسطة
-    if rsi < 30 and macd_bullish:
+    if rsi < 30:
         return "BUY", 70
-    # إشارة بيع متوسطة
-    if rsi > 70 and macd_bearish:
+    if rsi > 70:
         return "SELL", 70
     return "HOLD", 0
 
-# توليد بيانات شموع محاكاة (لأن السيرفر لا يدعم pyquotex حالياً)
-def generate_mock_candles(base_price=1.1000, count=100):
-    candles = []
-    price = base_price
-    for i in range(count):
-        change = random.uniform(-0.003, 0.003)
-        close = price + change
-        candles.append(close)
-        price = close
-    return candles
+def generate_mock_prices():
+    price = 1.1000
+    prices = []
+    for _ in range(100):
+        price += random.uniform(-0.003, 0.003)
+        prices.append(price)
+    return prices
+
+# ============= دورة التداول =============
+def trading_loop():
+    global bot_active, win_streak, loss_streak, total_trades, client
+    target = current_settings["target_trades"]
+    
+    while bot_active and total_trades < target:
+        if QUOTEX_AVAILABLE and client:
+            try:
+                candles = client.get_candles(current_settings["pair"], 100)
+                prices = [c['close'] for c in candles]
+            except:
+                prices = generate_mock_prices()
+        else:
+            prices = generate_mock_prices()
+        
+        signal, confidence = analyze_market(prices)
+        
+        if signal != "HOLD":
+            if QUOTEX_AVAILABLE and client:
+                direction = 'call' if signal == 'BUY' else 'put'
+                success = client.buy(current_settings["amount"], current_settings["pair"], direction, current_settings["duration"] * 60)
+            else:
+                success = True
+                is_win = random.random() < (confidence / 100)
+            
+            if success:
+                if QUOTEX_AVAILABLE and client:
+                    is_win = random.random() < 0.7
+                
+                if is_win:
+                    win_streak += 1
+                    loss_streak = 0
+                    print(f"✅ ربح! (الثقة: {confidence}%)")
+                    if win_streak >= 8:
+                        bot_active = False
+                        break
+                else:
+                    win_streak = 0
+                    loss_streak += 1
+                    print(f"❌ خسارة! (الثقة: {confidence}%)")
+                    if loss_streak >= 2:
+                        bot_active = False
+                        break
+                total_trades += 1
+                print(f"📊 تقدم: {total_trades}/{target}")
+        
+        wait_minutes = 3 + random.randint(0, 2)
+        for _ in range(wait_minutes * 60):
+            if not bot_active:
+                break
+            time.sleep(1)
+    
+    if bot_active and total_trades >= target:
+        bot_active = False
+        print(f"🎯 تم تحقيق الهدف: {target} صفقات")
 
 # ============= API Routes =============
-
-@app.route('/api/verify_license', methods=['POST'])
-def verify_license():
-    data = request.get_json()
-    license_key = data.get('license_key')
-    email = data.get('email')
-    device_id = data.get('device_id')
-    
-    license_info = valid_licenses.get(license_key)
-    if not license_info or license_info['email'] != email:
-        return jsonify({'success': False, 'message': 'كود غير صالح'}), 401
-    if datetime.fromisoformat(license_info['expiry_date']) < datetime.now():
-        return jsonify({'success': False, 'message': 'انتهت صلاحية الكود'}), 401
-    if license_info['device_id'] is None:
-        valid_licenses[license_key]['device_id'] = device_id
-    elif license_info['device_id'] != device_id:
-        return jsonify({'success': False, 'message': 'الكود مستخدم من جهاز آخر'}), 401
-    
-    return jsonify({'success': True, 'message': 'كود صالح'})
-
-@app.route('/api/login', methods=['POST'])
+@app.route('/login', methods=['POST'])
 def login():
+    global client
     data = request.get_json()
     email = data.get('email')
     password = data.get('password')
-    license_key = data.get('license_key')
     
-    license_info = valid_licenses.get(license_key)
-    if not license_info or license_info['email'] != email:
-        return jsonify({'success': False, 'message': 'رخصة غير صالحة'}), 401
-    
-    # محاكاة تسجيل الدخول
-    user_sessions[license_key] = {'email': email, 'logged_in': True}
-    return jsonify({'success': True, 'message': 'تم تسجيل الدخول بنجاح'})
+    if QUOTEX_AVAILABLE:
+        try:
+            client = Quotex(email=email, password=password)
+            if client.connect():
+                current_settings["email"] = email
+                current_settings["password"] = password
+                return jsonify({"status": "success", "message": "تم تسجيل الدخول"})
+            else:
+                return jsonify({"status": "error", "message": "فشل تسجيل الدخول"})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)})
+    else:
+        return jsonify({"status": "success", "message": "وضع المحاكاة (pyquotex غير مثبت)"})
 
-@app.route('/api/trade', methods=['POST'])
-def trade():
+@app.route('/start', methods=['POST'])
+def start():
+    global bot_active, win_streak, loss_streak, total_trades
     data = request.get_json()
-    license_key = data.get('license_key')
-    pair = data.get('pair')
-    amount = data.get('amount')
-    duration = data.get('duration')
-    
-    if license_key not in user_sessions:
-        return jsonify({'success': False, 'message': 'لم يتم تسجيل الدخول'}), 401
-    
-    # جلب بيانات الشموع للتحليل (محاكاة)
-    prices = generate_mock_candles()
-    signal, confidence = analyze_market(prices)
-    
-    if signal == "HOLD":
-        return jsonify({'success': False, 'message': 'لا توجد إشارة تداول الآن', 'signal': 'HOLD'})
-    
-    # محاكاة نتيجة الصفقة (نسبة الربح حسب قوة الإشارة)
-    win_rate = confidence / 100
-    is_win = random.random() < win_rate
-    
+    if data:
+        current_settings.update(data)
+    bot_active = True
+    win_streak = loss_streak = total_trades = 0
+    threading.Thread(target=trading_loop, daemon=True).start()
+    return jsonify({"status": "started", "settings": current_settings})
+
+@app.route('/stop', methods=['POST'])
+def stop():
+    global bot_active
+    bot_active = False
+    return jsonify({"status": "stopped"})
+
+@app.route('/status', methods=['GET'])
+def status():
     return jsonify({
-        'success': True,
-        'signal': signal,
-        'confidence': confidence,
-        'result': 'win' if is_win else 'loss',
-        'message': f'تم تنفيذ صفقة {signal} ({confidence}%) - {"رابحة 🟢" if is_win else "خاسرة 🔴"}'
+        "active": bot_active,
+        "win_streak": win_streak,
+        "loss_streak": loss_streak,
+        "total_trades": total_trades,
+        "settings": current_settings
     })
 
-@app.route('/api/assets', methods=['POST'])
-def get_assets():
-    data = request.get_json()
-    license_key = data.get('license_key')
-    
-    # قائمة عملات افتراضية (ستتحدث مع المنصة لاحقاً)
-    assets = [
-        'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD',
-        'NZD/USD', 'USD/CHF', 'BTC/USD', 'ETH/USD', 'XAU/USD',
-        'EUR/GBP', 'EUR/JPY', 'GBP/JPY', 'AUD/JPY', 'EUR/AUD'
-    ]
-    return jsonify({'success': True, 'assets': assets})
-
-# ============= Admin Routes (لتوليد الأكواد) =============
-
-@app.route('/api/generate_code', methods=['POST'])
-def generate_code():
-    data = request.get_json()
-    if data.get('password') != ADMIN_PASSWORD:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
-    email = data.get('email')
-    days = data.get('days', 30)
-    new_code = generate_random_code()
-    while new_code in valid_licenses:
-        new_code = generate_random_code()
-    valid_licenses[new_code] = {
-        "email": email,
-        "expiry_date": (datetime.now() + timedelta(days=days)).isoformat(),
-        "device_id": None,
-    }
-    return jsonify({'success': True, 'code': new_code})
-
-@app.route('/api/list_codes', methods=['POST'])
-def list_codes():
-    data = request.get_json()
-    if data.get('password') != ADMIN_PASSWORD:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
-    codes_list = [{"code": k, **v} for k, v in valid_licenses.items()]
-    return jsonify({'success': True, 'codes': codes_list})
-
-@app.route('/api/delete_code', methods=['POST'])
-def delete_code():
-    data = request.get_json()
-    if data.get('password') != ADMIN_PASSWORD:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
-    code = data.get('code')
-    if code in valid_licenses:
-        del valid_licenses[code]
-        return jsonify({'success': True})
-    return jsonify({'success': False, 'message': 'Code not found'}), 404
+@app.route('/assets', methods=['GET'])
+def assets():
+    global client
+    if QUOTEX_AVAILABLE and client:
+        try:
+            assets = client.get_assets()
+            if assets and len(assets) > 0:
+                return jsonify({"assets": assets})
+        except:
+            pass
+    return jsonify({"assets": default_assets})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
